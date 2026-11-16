@@ -508,9 +508,14 @@ impl Player {
         self.pos = geo::lla_to_pos(flat, flon, final_alt as f64);
         self.last_sample = sample;
 
+        let prev_phase = self.walk_phase;
         let horiz_speed = Vec2::new(self.vel.x, self.vel.y).length();
         if self.grounded && horiz_speed > 0.15 {
             self.walk_phase = (self.walk_phase + horiz_speed * dt * 2.4).rem_euclid(std::f32::consts::TAU);
+            let half = std::f32::consts::PI;
+            if (prev_phase < half && self.walk_phase >= half) || self.walk_phase < prev_phase {
+                self.events.push(Event::Touch(0.3));
+            }
         }
     }
 
@@ -591,6 +596,7 @@ impl Player {
                 let new_r = GEAR_RATIOS[(car.gear - 1) as usize];
                 car.rpm = (car.rpm * (new_r / old_r)).max(IDLE_RPM);
                 car.shift_timer = 0.28;
+                self.events.push(Event::Bump(0.15));
             } else if car.gear > 1 && car.rpm <= DOWNSHIFT_RPM && v_fwd > 2.0 {
                 let old_r = GEAR_RATIOS[(car.gear - 1) as usize];
                 car.gear -= 1;
@@ -827,22 +833,32 @@ impl Player {
     }
 
     /// Synthesise `audio::Params` for `CarDrive` or `OnFoot` so `src/audio.rs` produces
-    /// realistic engine RPM, exhaust note, tire rolling/braking squeal, and wall scrape audio.
-    pub fn audio_params(&self, master: f32, cam_dist: f32) -> Params {
+    /// realistic 4-cylinder engine RPM (`700..2650`), exhaust backfire pops on shift/throttle-chop,
+    /// tire rolling/braking squeal (`2450 Hz`), and wall scrape audio.
+    pub fn audio_params(&self, master: f32, cam_dist: f32, interior_cam: bool, fire: f32) -> Params {
         match self.mode {
             PlayMode::CarDrive => {
                 if let Some(car) = &self.car {
                     let speed = car.vel.length();
-                    let power = ((car.rpm - IDLE_RPM) / (REDLINE_RPM - IDLE_RPM)).clamp(0.0, 1.0) * (0.25 + 0.75 * car.throttle);
+                    let rpm_norm = ((car.rpm - IDLE_RPM) / (REDLINE_RPM - IDLE_RPM)).clamp(0.0, 1.0);
+                    let synth_rpm = 700.0 + rpm_norm * (2650.0 - 700.0);
+                    let shift_pop = car.shift_timer > 0.14;
+                    let eff_throttle = if shift_pop { 0.0 } else { car.throttle };
+                    let power = if shift_pop {
+                        (rpm_norm * 0.95).max(0.55)
+                    } else {
+                        (rpm_norm * (0.35 + 0.65 * car.throttle)).max(if car.throttle < 0.1 && rpm_norm > 0.45 { rpm_norm * 0.85 } else { 0.0 })
+                    };
+                    let cabin = if interior_cam { 1.0 } else { 0.0 };
                     Params {
                         live: 1.0,
                         master,
-                        rpm: car.rpm * 0.48,
+                        rpm: synth_rpm,
                         power,
-                        throttle: car.throttle,
+                        throttle: eff_throttle,
                         health: 1.0,
-                        prop: 0.0,
-                        airspeed: speed,
+                        prop: 1.0,
+                        airspeed: speed * 0.65,
                         vne: 95.0,
                         jet: 0.0,
                         n1: 0.0,
@@ -862,23 +878,34 @@ impl Player {
                         scrape: car.scrape,
                         foliage: 0.0,
                         cracked: 0.0,
-                        cabin: 0.45,
-                        dist: cam_dist,
-                        fire: 0.0,
+                        cabin,
+                        dist: if interior_cam { 1.2 } else { cam_dist.max(2.5) },
+                        fire,
                         warn: Warn::default(),
                     }
                 } else {
-                    Params { live: 0.0, master, ..Default::default() }
+                    Params { live: 0.0, master, fire, ..Default::default() }
                 }
             }
-            PlayMode::OnFoot => Params {
-                live: 0.0,
-                master,
-                airspeed: self.vel.length(),
-                dist: cam_dist,
-                ..Default::default()
-            },
-            PlayMode::PlaneFlight => Params { live: 0.0, master, ..Default::default() },
+            PlayMode::OnFoot => {
+                let walk_speed = self.vel.truncate().length();
+                Params {
+                    live: 1.0,
+                    master,
+                    rpm: 0.0,
+                    power: 0.0,
+                    throttle: 0.0,
+                    health: 1.0,
+                    prop: 1.0,
+                    airspeed: walk_speed * 0.5,
+                    vne: 95.0,
+                    cabin: if interior_cam { 0.25 } else { 0.0 },
+                    dist: cam_dist.max(1.0),
+                    fire,
+                    ..Default::default()
+                }
+            }
+            PlayMode::PlaneFlight => Params { live: 0.0, master, fire, ..Default::default() },
         }
     }
 
@@ -964,5 +991,12 @@ mod tests {
         // Press F again within 3.5m to re-enter the parked car.
         player.step(1.0 / 60.0, &exit_in, &mut world, None, None, 0.0);
         assert_eq!(player.mode, PlayMode::CarDrive);
+
+        // Verify audio synthesis mapping for 4-stroke piston exhaust (`700..2650` RPM) and cabin toggle.
+        player.car.as_mut().unwrap().rpm = 6500.0;
+        let ap_chase = player.audio_params(1.0, 6.2, false, 0.0);
+        assert!((ap_chase.rpm - 2650.0).abs() < 1.0 && ap_chase.jet == 0.0 && ap_chase.cabin == 0.0);
+        let ap_interior = player.audio_params(1.0, 0.5, true, 0.0);
+        assert!((ap_interior.cabin - 1.0).abs() < 1e-4);
     }
 }

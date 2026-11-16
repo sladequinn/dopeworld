@@ -81,6 +81,7 @@ use glam::{DMat4, DQuat, DVec2, DVec3, Mat4, Vec2, Vec3};
 use i18n::{t, tr};
 use padui::Hint;
 use plane::{Controls, Plane};
+use player::{PlayMode, Player, PlayerInput};
 use render::{DrawObj, Frame, Globals, PSim, Renderer};
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -257,12 +258,14 @@ struct Args {
     /// fuel to start with (fraction of full tanks), and the engine off on the ground
     fuel: Option<f64>,
     cold: bool,
+    /// start on the street in `CarDrive` or `OnFoot` mode
+    street: Option<PlayMode>,
 }
 
 fn parse_args() -> Args {
     let mut a = Args {
-        lat: 37.8085,
-        lon: -122.4650,
+        lat: 43.4516,
+        lon: -80.4925,
         alt: None,
         agl: None,
         heading: 95.0,
@@ -312,6 +315,7 @@ fn parse_args() -> Args {
         no_hud: false,
         fuel: None,
         cold: false,
+        street: None,
     };
     let v: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -498,6 +502,16 @@ fn parse_args() -> Args {
             }
             "--no-photoreal" => {
                 a.photoreal = Some(false);
+                used = 1;
+            }
+            "--street" | "--drive" => {
+                a.street = Some(PlayMode::CarDrive);
+                a.menu.get_or_insert(false);
+                used = 1;
+            }
+            "--walk" => {
+                a.street = Some(PlayMode::OnFoot);
+                a.menu.get_or_insert(false);
                 used = 1;
             }
             "--help" | "-h" => {
@@ -731,6 +745,14 @@ struct Game {
     radios: nav::Radios,
     /// waiting on the ground for the terrain to load: where, and until when at most
     hold_spot: Option<(f64, f64, f64)>,
+    /// grounded street-level player controller (`OnFoot`, `CarDrive`, `PlaneFlight`)
+    player: Player,
+    /// pending street spawn `(lat_rad, lon_rad, enter_car)` waiting for the `DATA_ZOOM` road tile
+    pending_street_spawn: Option<(f64, f64, bool)>,
+    /// edge-triggered vehicle/aircraft enter/exit (`KeyF` / `KeyE`)
+    interact_edge: bool,
+    /// smoothed chase camera yaw (radians in ENU) when driving or walking
+    street_cam_yaw: f32,
 }
 
 impl Game {
@@ -840,6 +862,20 @@ impl Game {
         // everything within the aircraft's bounds, and a little around them
         // for the gear, flaps and control surfaces as they move.
         let (cy, cp, cd) = args.cam.unwrap_or((0.0, 0.2, spec.cam_dist));
+        let ground_h0 = ground_elev(&src, lat, lon);
+        let street_pos0 = geo::lla_to_pos(lat.to_radians(), lon.to_radians(), ground_h0);
+        let default_play_mode = if args.airport.is_some() || args.alt.is_some() || args.agl.is_some() || args.crash_at.is_some() || args.boost_at.is_some() {
+            PlayMode::PlaneFlight
+        } else {
+            args.street.unwrap_or(PlayMode::CarDrive)
+        };
+        let mut player = Player::new(street_pos0, args.heading.to_radians() as f32, default_play_mode);
+        let pending_street_spawn = if default_play_mode != PlayMode::PlaneFlight {
+            player.spawn_car_near(&world, lat.to_radians(), lon.to_radians(), 0, [0.75, 0.08, 0.06], default_play_mode == PlayMode::CarDrive);
+            Some((lat.to_radians(), lon.to_radians(), default_play_mode == PlayMode::CarDrive))
+        } else {
+            None
+        };
         let mut g = Self {
             gkey: src.google.key(), gkey_show: false, gm_logo: None, stills: vec![None; aircraft::ALL.len()], window, r, world, src, spec, model, piece_mesh, group_mesh, piece_cut, group_pivots, hangar: Vec::new(), building: Vec::new(), crashed: false, crash: None, crash_real: 0.0, egui_ctx, egui_state, keys: HashSet::new(), drag: false, last_cursor: None,
             cam_yaw: cy.to_radians(), cam_pitch: cp, cam_dist: cd, cam_mode: if args.cockpit { 1 } else { prefs.cam_mode }, cam_pos, cam_dir: -plane.forward(), cam_look: plane.pos, orbit: 0.0, cam_rise: 0.0, cam_clear_t: 0.0, cam_ang: None, cam_hold: 0.0,
@@ -849,10 +885,14 @@ impl Game {
             audio: if args.record.is_some() { Some(audio::Audio::offline()) } else if args.mute { None } else { audio::Audio::new() },
             record: args.record.clone(), rec_audio: Vec::new(), rec_n: 0, rec_t0: Instant::now(), sound_on: prefs.sound_on, volume: prefs.volume, info_open: false, info_page: menu::Page::Flight, pause_open: false, pause_page: menu::Page::Game, pause_at: args.pause_menu, look_sens: prefs.look_sens, head: cockpit::Head::new(cy.to_radians(), cp), cockpit_fov: args.fov.unwrap_or(prefs.cockpit_fov).clamp(30.0, 90.0), head_live: false, warn: audio::Warn::default(), warn_t: [-10.0; 4],
             g_slow: 1.0, last_bump: 0.0, was_ground: false, prev_vs: 0.0, prev_gear: plane.gear, prev_flaps: plane.flaps, quit: false,
-            mode: if args.menu.unwrap_or(true) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
+            mode: if args.menu.unwrap_or(false) { Mode::Menu } else { Mode::Fly }, menu, menu_go: args.menu_go, heading: args.heading.to_radians(), destr: destruct::Destruction::new(secs.to_bits()),
             sheds: damage::Sheds::default(), fx_anchor: plane.pos, fx_shift: DVec3::ZERO, smoke_acc: 0.0, flash: Vec::new(), damage_spec: args.damage.clone(), wreck_dirty: false, wreck_t: 0.0, wreck_seen: 0.0,
             start_rx: None, name_rx: None, last_click: -10.0, n_cars: 0, city_glow: 0.0, gauges: gauges::Gauges::new(&plane, secs.to_bits()), plane,
             airport_rx: None, hold_spot: None,
+            player,
+            pending_street_spawn,
+            interact_edge: false,
+            street_cam_yaw: args.heading.to_radians() as f32,
             prefs_lang: args.lang.or(prefs.lang),
             prefs_t: 0.0,
             live: live::Live::new(prefs.live_traffic),
@@ -1025,6 +1065,32 @@ impl Game {
 
     fn respawn(&mut self, lat: f64, lon: f64, alt: f64, heading: f64) {
         self.respawn_at(lat, lon, alt, heading, self.spec.cruise);
+    }
+
+    fn respawn_street(&mut self, lat: f64, lon: f64, elev: f64, enter_car: bool) {
+        self.hold_spot = None;
+        self.parking_brake = false;
+        self.crashed = false;
+        self.crash = None;
+        self.flash.clear();
+        self.cam_yaw = 0.0;
+        self.cam_pitch = 0.0;
+        let p0 = geo::lla_to_pos(lat, lon, elev);
+        self.player.pos = p0;
+        self.player.vel = Vec3::ZERO;
+        self.player.yaw = self.heading as f32;
+        self.player.pitch = 0.0;
+        self.player.grounded = true;
+        self.player.mode = if enter_car { PlayMode::CarDrive } else { PlayMode::OnFoot };
+        self.player.spawn_car_near(&self.world, lat, lon, 0, [0.75, 0.08, 0.06], enter_car);
+        self.pending_street_spawn = if self.world.has_detail_tile(lat, lon) {
+            None
+        } else {
+            Some((lat, lon, enter_car))
+        };
+        self.street_cam_yaw = self.player.yaw;
+        self.cam_pos = self.player.pos;
+        self.prev_cam = self.cam_pos;
     }
 
     fn respawn_at(&mut self, lat: f64, lon: f64, alt: f64, heading: f64, speed: f64) {
@@ -1983,7 +2049,19 @@ impl Game {
             KeyCode::Escape => self.set_pause_menu(true),
             KeyCode::KeyR => self.respawn_here(),
             KeyCode::KeyC => self.cam_mode = (self.cam_mode + 1) % 2,
-            KeyCode::KeyF if !self.crashed => self.plane.set_flaps(1),
+            KeyCode::KeyF => {
+                if self.player.mode != PlayMode::PlaneFlight {
+                    self.interact_edge = true;
+                } else if !self.crashed {
+                    let up = self.plane.pos.normalize();
+                    let gs = (self.plane.vel - up * self.plane.vel.dot(up)).length();
+                    if self.plane.on_ground && gs < player::LOW_EXIT_SPEED as f64 {
+                        self.interact_edge = true;
+                    } else {
+                        self.plane.set_flaps(1);
+                    }
+                }
+            }
             KeyCode::KeyV if !self.crashed => self.plane.set_flaps(-1),
             KeyCode::KeyL if !self.crashed => self.plane.toggle_gear(),
             KeyCode::Slash if !self.crashed => self.plane.toggle_speedbrake(),
@@ -2086,7 +2164,8 @@ impl Game {
     fn to_globe(&mut self) {
         self.set_pause_menu(false);
         self.info_open = false;
-        let (lat, lon, _) = geo::pos_to_lla(self.plane.pos);
+        let ref_pos = if self.player.mode != PlayMode::PlaneFlight { self.player.pos } else { self.plane.pos };
+        let (lat, lon, _) = geo::pos_to_lla(ref_pos);
         self.menu.look_at(lat.to_degrees(), lon.to_degrees(), 60_000.0);
         self.menu.pick = Some((lat.to_degrees(), lon.to_degrees()));
         self.menu.hour = (self.utc + lon.to_degrees() / 15.0).rem_euclid(24.0);
@@ -2094,8 +2173,15 @@ impl Game {
         self.mode = Mode::Menu;
     }
 
-    /// A fresh aircraft in the air over where we are (or where we crashed), on the same heading.
+    /// A fresh aircraft in the air over where we are (or where we crashed), on the same heading,
+    /// or a fresh street spawn when in `CarDrive` / `OnFoot`.
     fn respawn_here(&mut self) {
+        if self.player.mode != PlayMode::PlaneFlight {
+            let (lat, lon, h) = geo::pos_to_lla(self.player.pos);
+            let g = self.world.ground(lat, lon).map(|g| g.h).unwrap_or(h);
+            self.respawn_street(lat, lon, g, self.player.mode == PlayMode::CarDrive);
+            return;
+        }
         let (lat, lon, h) = geo::pos_to_lla(if self.crashed { self.crash.as_ref().map(|c| c.site).unwrap_or(self.plane.pos) } else { self.plane.pos });
         let g = self.world.ground(lat, lon).map(|g| g.h).unwrap_or(h);
         let hd = self.plane.forward().dot(geo::enu(self.plane.pos).0).atan2(self.plane.forward().dot(geo::enu(self.plane.pos).1));
@@ -2376,8 +2462,27 @@ impl Game {
         w
     }
 
-    /// Tell the sound what the aircraft and the camera are doing.
+    /// Tell the sound what the aircraft or street player and the camera are doing.
     fn update_audio(&mut self, cam: DVec3, fire: f32, in_menu: bool, c: &Controls, dt: f64, scrape: f32) {
+        if self.player.mode != PlayMode::PlaneFlight {
+            self.warn = audio::Warn::default();
+            let live = !self.crashed && !in_menu && dt > 0.0;
+            let master = if self.sound_on && live { self.volume } else { 0.0 };
+            let dist = (cam - self.player.pos).length() as f32;
+            let mut params = self.player.audio_params(master, dist, self.cam_mode == 1, fire);
+            if !live {
+                params.live = 0.0;
+            }
+            if let Some(a) = &self.audio {
+                for e in self.player.events.drain(..) {
+                    a.event(e);
+                }
+                a.set(params);
+            } else {
+                self.player.events.clear();
+            }
+            return;
+        }
         self.warn = if dt > 0.0 { self.warnings() } else { audio::Warn::default() };
         let live = !self.crashed && !in_menu && dt > 0.0;
         let p = &self.plane;
@@ -2534,9 +2639,14 @@ impl Game {
                         let _ = elev;
                     }
                     Some((lat, lon, elev, name)) => {
-                        let local = (self.utc + geo::pos_to_lla(self.plane.pos).1.to_degrees() / 15.0).rem_euclid(24.0);
+                        let ref_pos = if self.player.mode != PlayMode::PlaneFlight { self.player.pos } else { self.plane.pos };
+                        let local = (self.utc + geo::pos_to_lla(ref_pos).1.to_degrees() / 15.0).rem_euclid(24.0);
                         self.utc = (local - lon / 15.0).rem_euclid(24.0);
-                        self.respawn(lat.to_radians(), lon.to_radians(), elev + 450.0, 0.0);
+                        if self.player.mode != PlayMode::PlaneFlight {
+                            self.respawn_street(lat.to_radians(), lon.to_radians(), elev, self.player.mode == PlayMode::CarDrive);
+                        } else {
+                            self.respawn(lat.to_radians(), lon.to_radians(), elev + 450.0, 0.0);
+                        }
                         self.status = name;
                     }
                     None => {
@@ -2557,7 +2667,11 @@ impl Game {
             if let Ok((lat, lon, elev)) = rx.try_recv() {
                 self.start_rx = None;
                 self.utc = (self.menu.hour - lon / 15.0).rem_euclid(24.0);
-                self.respawn(lat.to_radians(), lon.to_radians(), elev + self.menu.start_agl, self.heading);
+                if self.player.mode != PlayMode::PlaneFlight {
+                    self.respawn_street(lat.to_radians(), lon.to_radians(), elev, self.player.mode == PlayMode::CarDrive);
+                } else {
+                    self.respawn(lat.to_radians(), lon.to_radians(), elev + self.menu.start_agl, self.heading);
+                }
                 self.status = self.menu.pick_name.clone();
                 self.status_until = self.real + 10.0;
                 self.mode = Mode::Fly;
@@ -2636,12 +2750,73 @@ impl Game {
         let mut emit = Vec::new();
         let mut femit: Vec<(DVec3, render::Particle)> = Vec::new();
         let (mut scrape_n, mut steps) = (0usize, 0usize);
+
+        // Snap pending street spawn onto the nearest road lane once the DATA_ZOOM detail tile is ready.
+        if let Some((slat, slon, enter_car)) = self.pending_street_spawn {
+            if self.world.has_detail_tile(slat, slon) {
+                self.player.spawn_car_near(&self.world, slat, slon, 0, [0.75, 0.08, 0.06], enter_car);
+                self.street_cam_yaw = self.player.yaw;
+                self.pending_street_spawn = None;
+            }
+        }
+
         if !self.crashed && !in_menu {
-            self.acc += dt;
-            let h = 1.0 / 180.0;
-            while self.acc >= h {
-                self.acc -= h;
-                let imp = self.plane.step(h, &c, &self.world);
+            if self.player.mode != PlayMode::PlaneFlight {
+                if dt > 0.0 {
+                    let k = |code: KeyCode| self.keys.contains(&code);
+                    let ax = |pos: bool, neg: bool| (pos as i32 - neg as i32) as f32;
+                    let move_fwd = (ax(k(KeyCode::KeyW) || k(KeyCode::ArrowUp), k(KeyCode::KeyS) || k(KeyCode::ArrowDown)) - self.pad.pitch as f32).clamp(-1.0, 1.0);
+                    let move_right = (ax(k(KeyCode::KeyD) || k(KeyCode::ArrowRight), k(KeyCode::KeyA) || k(KeyCode::ArrowLeft)) + self.pad.roll as f32).clamp(-1.0, 1.0);
+                    let yaw_key = ax(k(KeyCode::KeyE), k(KeyCode::KeyQ));
+                    let interact = std::mem::take(&mut self.interact_edge);
+                    let p_up = self.plane.pos.normalize();
+                    let p_gs = (self.plane.vel - p_up * self.plane.vel.dot(p_up)).length() as f32;
+                    let pin = PlayerInput {
+                        move_fwd,
+                        move_right,
+                        sprint: k(KeyCode::ShiftLeft) || k(KeyCode::ShiftRight),
+                        jump: k(KeyCode::Space),
+                        handbrake: k(KeyCode::KeyB) || k(KeyCode::Space) || self.parking_brake,
+                        interact,
+                        yaw_delta: yaw_key * 1.8 * dt as f32,
+                        pitch_delta: 0.0,
+                    };
+                    let prev_mode = self.player.mode;
+                    self.player.step(dt as f32, &pin, &mut self.world, Some(self.plane.pos), Some(self.plane.forward()), p_gs);
+                    if self.player.mode != prev_mode {
+                        self.cam_yaw = 0.0;
+                        self.cam_pitch = 0.0;
+                    }
+                    // Knock down any trees the car ploughs through at speed.
+                    if self.player.mode == PlayMode::CarDrive && self.player.vel.length() > 6.5 {
+                        let mut tree_hits = Vec::new();
+                        self.world.trees_near(self.player.pos, 1.4, &mut tree_hits);
+                        if !tree_hits.is_empty() {
+                            self.anchor_fx(tree_hits[0].pos);
+                            let (ce, cn, cu) = geo::enu(self.player.pos);
+                            let v_world = ce * self.player.vel.x as f64 + cn * self.player.vel.y as f64 + cu * self.player.vel.z as f64;
+                            for t in &tree_hits {
+                                self.destr.knock(&mut self.world, &self.r.queue, t, v_world, 1.1, 0.0, 0.0);
+                            }
+                            self.player.events.push(audio::Event::Crunch(1.0));
+                        }
+                    }
+                }
+            } else {
+                if std::mem::take(&mut self.interact_edge) {
+                    let p_up = self.plane.pos.normalize();
+                    let p_gs = (self.plane.vel - p_up * self.plane.vel.dot(p_up)).length() as f32;
+                    if self.player.try_toggle_vehicle(&mut self.world, Some(self.plane.pos), Some(self.plane.forward()), p_gs) {
+                        self.street_cam_yaw = self.player.yaw;
+                        self.cam_yaw = 0.0;
+                        self.cam_pitch = 0.0;
+                    }
+                }
+                self.acc += dt;
+                let h = 1.0 / 180.0;
+                while self.acc >= h {
+                    self.acc -= h;
+                    let imp = self.plane.step(h, &c, &self.world);
                 self.gauges.update(h, &self.plane, self.time);
                 steps += 1;
                 scrape_n += self.plane.sparks.len();
@@ -2775,6 +2950,7 @@ impl Game {
                     self.cam_rise = 0.0;
                     self.acc = 0.0;
                     break;
+                }
                 }
             }
         }
@@ -3004,6 +3180,105 @@ impl Game {
             cam = self.cam_pos;
             dir = (self.cam_look - cam).normalize();
             upv = u;
+        } else if self.player.mode == PlayMode::CarDrive {
+            let (east, north, up) = geo::enu(self.player.pos);
+            let car = self.player.car.as_ref();
+            let car_pos = car.map(|c| c.pos).unwrap_or(self.player.pos);
+            let (right_v, up_v, fwd_v) = car.map(|c| c.world_basis()).unwrap_or((east.as_vec3(), up.as_vec3(), north.as_vec3()));
+            let (car_right, car_up, car_fwd) = (right_v.as_dvec3(), up_v.as_dvec3(), fwd_v.as_dvec3());
+            if self.cam_mode == 1 {
+                // Hood / driver-seat interior camera (`cabin = 1.0`).
+                let seat = car_pos - car_right * 0.35 + car_up * 1.18 + car_fwd * 0.15;
+                let (sy, cy) = self.cam_yaw.sin_cos();
+                let (sp, cp) = self.cam_pitch.clamp(-0.65, 0.55).sin_cos();
+                let look_h = (car_fwd * cy - car_right * sy).normalize_or_zero();
+                cam = seat;
+                dir = (look_h * cp + car_up * sp).normalize();
+                upv = car_up;
+                self.cam_pos = cam;
+            } else {
+                // Chase camera (`dist = 6.2m`, `height = 1.65m` above road, looking at `car_pos + up * 0.7m + fwd * 2.0m`)
+                // with smooth velocity-aligned yaw follow.
+                let vel_en = car.map(|c| Vec2::new(c.vel.x, c.vel.y)).unwrap_or(Vec2::ZERO);
+                let speed_h = vel_en.length();
+                let target_yaw = if speed_h > 1.8 {
+                    vel_en.x.atan2(vel_en.y)
+                } else {
+                    car.map(|c| c.yaw).unwrap_or(self.player.yaw)
+                };
+                let dyaw = (target_yaw - self.street_cam_yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+                self.street_cam_yaw = (self.street_cam_yaw + dyaw * (dt_real as f32 * 4.5).min(1.0)).rem_euclid(std::f32::consts::TAU);
+
+                let total_yaw = self.street_cam_yaw as f64 - self.cam_yaw;
+                let (sy, cy) = total_yaw.sin_cos();
+                let follow_fwd = (east * sy + north * cy).normalize();
+                let pitch_off = self.cam_pitch.clamp(-0.35, 0.65);
+                let dist = 6.2f64;
+                let height = 1.65f64 + dist * pitch_off.sin() * 0.65;
+                let mut cand = car_pos - follow_fwd * (dist * pitch_off.cos()) + up * height;
+
+                let (_, _, cand_alt) = geo::pos_to_lla(cand);
+                let cs = self.world.query_street(cand, cand_alt as f32, 0.45);
+                if let Some((n_en, depth)) = cs.wall_push {
+                    cand += (east * n_en.x as f64 + north * n_en.y as f64) * (depth + 0.05) as f64;
+                }
+                let (clat, clon, calt2) = geo::pos_to_lla(cand);
+                let min_alt = cs.support_alt as f64 + 0.35;
+                if calt2 < min_alt {
+                    cand = geo::lla_to_pos(clat, clon, min_alt);
+                }
+
+                let look_target = car_pos + up * 0.7 + car_fwd * 2.0;
+                cam = cand;
+                dir = (look_target - cam).normalize();
+                upv = up;
+                self.cam_pos = cam;
+                self.cam_look = look_target;
+            }
+        } else if self.player.mode == PlayMode::OnFoot {
+            let (east, north, up) = geo::enu(self.player.pos);
+            let look_yaw = self.player.yaw as f64 - self.cam_yaw;
+            let look_pitch = (self.player.pitch as f64 - self.cam_pitch).clamp(-1.35, 1.35);
+            let (sy, cy) = look_yaw.sin_cos();
+            let (sp, cp) = look_pitch.sin_cos();
+            let fwd_h = (east * sy + north * cy).normalize();
+            let right_h = (east * cy - north * sy).normalize();
+            let look_dir = (fwd_h * cp + up * sp).normalize();
+
+            if self.cam_mode == 1 {
+                // First-Person camera (`eye_height = 1.72m`) with subtle walk bob.
+                let speed_h = self.player.vel.truncate().length();
+                let bob = if self.player.grounded && speed_h > 0.2 {
+                    (self.player.walk_phase.sin() * 0.032 * (speed_h / player::WALK_SPEED).min(1.6)) as f64
+                } else {
+                    0.0
+                };
+                cam = self.player.pos + up * (player::EYE_HEIGHT as f64 + bob);
+                dir = look_dir;
+                upv = up;
+                self.cam_pos = cam;
+            } else {
+                // Over-the-Shoulder Third-Person (`dist = 2.6m`, `height = 1.6m`).
+                let dist = 2.6f64;
+                let height = 1.6f64;
+                let pivot = self.player.pos + up * height + right_h * 0.42;
+                let mut cand = pivot - look_dir * dist;
+                let (_, _, cand_alt) = geo::pos_to_lla(cand);
+                let cs = self.world.query_street(cand, cand_alt as f32, 0.38);
+                if let Some((n_en, depth)) = cs.wall_push {
+                    cand += (east * n_en.x as f64 + north * n_en.y as f64) * (depth + 0.05) as f64;
+                }
+                let (clat, clon, calt2) = geo::pos_to_lla(cand);
+                let min_alt = cs.support_alt as f64 + 0.35;
+                if calt2 < min_alt {
+                    cand = geo::lla_to_pos(clat, clon, min_alt);
+                }
+                let target = pivot + fwd_h * 4.0 + up * (sp * 2.5);
+                cam = cand;
+                dir = (target - cam).normalize();
+                upv = up;
+                self.cam_pos = cam;
+            }
         } else if self.cam_mode == 1 {
             if !self.head_live {
                 self.head.reset(self.cam_yaw, self.cam_pitch);
@@ -3042,8 +3317,9 @@ impl Game {
         // Never let the camera sink into the ground.
         let (clat, clon, calt) = geo::pos_to_lla(cam);
         let ground = self.world.ground(clat, clon).map(|g| g.h);
+        let min_clear = if self.player.mode != PlayMode::PlaneFlight { 0.35 } else { 1.5 };
         let cam = match ground {
-            Some(g) if calt < g + 1.5 => cam + cam.normalize() * (g + 1.5 - calt),
+            Some(g) if calt < g + min_clear => cam + cam.normalize() * (g + min_clear - calt),
             _ => cam,
         };
         let calt = geo::pos_to_lla(cam).2;
@@ -3068,7 +3344,15 @@ impl Game {
         let vp_jit = Mat4::from_translation(jitter.extend(0.0)) * vp;
         let frustum = world::Frustum::new(DMat4::from_cols_array(&vp.to_cols_array().map(|v| v as f64)));
         self.world.update(&self.r, cam, &frustum);
-        let focus_abs = if in_menu { cam } else if self.crashed { self.crash.as_ref().unwrap().site } else { self.plane.pos };
+        let focus_abs = if in_menu {
+            cam
+        } else if self.crashed {
+            self.crash.as_ref().unwrap().site
+        } else if self.player.mode != PlayMode::PlaneFlight {
+            self.player.pos
+        } else {
+            self.plane.pos
+        };
         {
             // Photorealistic 3D tiles in flight, day and night (after dusk the
             // mesh takes our street lamps and lit windows, photo.wgsl).
@@ -3079,7 +3363,7 @@ impl Game {
         if dt > 0.0 {
             self.world.update_traffic(dt as f32, focus_abs);
             let local = (self.utc + geo::pos_to_lla(focus_abs).1.to_degrees() / 15.0).rem_euclid(24.0);
-            let player = (!self.crashed && !in_menu).then_some(self.plane.pos);
+            let player = (!self.crashed && !in_menu).then_some(focus_abs);
             self.world.update_airports(dt as f32, self.wx.wind_from as f32, (self.wx.wind * 1.94384) as f32, (cars::activity(local as f32) * 1.2).clamp(0.25, 1.0), player, focus_abs);
         }
 
@@ -3351,6 +3635,9 @@ impl Game {
             let local = (self.utc + clon.to_degrees() / 15.0).rem_euclid(24.0);
             let sun_up = geo::enu(cam).2.dot(self.sun_dir());
             self.world.car_instances(cam, cars::activity(local as f32), sun_up, &mut insts, &mut air_lights);
+            if !(self.player.mode == PlayMode::CarDrive && self.cam_mode == 1) {
+                self.player.emit_car_instance(cam, sun_up, &mut insts, &mut air_lights);
+            }
             self.n_cars = insts.len();
             self.destr.instances(cam, &mut insts, &mut fall);
             self.destr.skin_frame(cam);
@@ -4548,10 +4835,15 @@ impl Game {
 
     fn ui(&mut self, agl: f64) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32) {
         let raw = self.egui_input();
-        let (lat, lon, alt) = geo::pos_to_lla(self.plane.pos);
-        let (e, n, u) = geo::enu(self.plane.pos);
+        let active_pos = if self.player.mode != PlayMode::PlaneFlight { self.player.pos } else { self.plane.pos };
+        let (lat, lon, alt) = geo::pos_to_lla(active_pos);
+        let (e, n, u) = geo::enu(active_pos);
         let f = self.plane.forward();
-        let hdg = f.dot(e).atan2(f.dot(n)).to_degrees().rem_euclid(360.0);
+        let hdg = if self.player.mode != PlayMode::PlaneFlight {
+            (self.player.yaw as f64).to_degrees().rem_euclid(360.0)
+        } else {
+            f.dot(e).atan2(f.dot(n)).to_degrees().rem_euclid(360.0)
+        };
         // Indicated airspeed: what the wing feels, and what the overspeed warnings are about.
         let speed = self.plane.ias();
         let tas = self.plane.airspeed().length();
@@ -4563,7 +4855,7 @@ impl Game {
         let mut close_goto = false;
         let mut act = None;
         let stats = self.world.stats;
-        let airport_hud = self.airport_hud();
+        let airport_hud = if self.player.mode == PlayMode::PlaneFlight { self.airport_hud() } else { None };
         self.src.google.update_attribution(lat.to_degrees(), lon.to_degrees(), agl);
         self.flash.retain(|(_, t)| self.real - t < 4.0);
         let out = self.egui_ctx.clone().run_ui(raw, |root| {
@@ -4587,43 +4879,99 @@ impl Game {
                 self.info_panel(ctx, &mut act, lat.to_degrees(), lon.to_degrees(), local, speed, alt, agl, hdg);
             }
             if self.show_hud {
-                egui::Area::new(egui::Id::unique("hud")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
-                    panel.show(ui, |ui| {
-                        shadow(ui, format!("IAS {:>4.0} kt", speed * 1.94384), 20.0, white);
-                        shadow(ui, format!("ALT {:>5.0} ft", alt * 3.28084), 20.0, white);
-                        shadow(ui, format!("AGL {:>5.0} ft", agl.max(0.0) * 3.28084), 14.0, dim);
-                        shadow(ui, format!("HDG {:>4.0}°   VS {:>+6.0} fpm", hdg, vs * 196.85), 14.0, dim);
-                        if wind_kt >= 0.5 {
-                            shadow(ui, format!("TAS {:>3.0}  GS {:>3.0} kt   WIND {:03.0}°/{:.0}", tas * 1.94384, gs * 1.94384, self.wx.wind_from, wind_kt), 14.0, dim);
-                        } else {
-                            shadow(ui, format!("TAS {:>4.0} kt", tas * 1.94384), 14.0, dim);
-                        }
-                        let p = &self.plane;
-                        if p.spec.is_jet() {
-                            let rev = if p.reverser > 0.95 { "   REV" } else if p.reverser > 0.0 { "   rev" } else { "" };
-                            shadow(ui, format!("THR {:>3.0}%   N1 {:>3.0}%   G {:>4.1}{rev}", p.throttle * 100.0, p.n1 * 100.0, p.g_load), 14.0, dim);
-                        } else {
-                            shadow(ui, format!("THR {:>3.0}%   {:>4.0} rpm   G {:>4.1}", p.throttle * 100.0, p.prop_rate * 60.0 / std::f64::consts::TAU, p.g_load), 14.0, if p.prop_rate * 60.0 / std::f64::consts::TAU > 2710.0 { Color32::from_rgb(255, 190, 60) } else { dim });
-                        }
-                        let gear = if p.gear >= 1.0 { "DOWN".to_string() } else if p.gear <= 0.0 { "UP".to_string() } else { "transit".to_string() };
-                        let sb = if p.spoilers > 0.05 { "   SPDBRK" } else { "" };
-                        shadow(ui, format!("FUEL {:>3.0}%   {:.0} kg{}", p.fuel_frac() * 100.0, p.fuel, if p.running { "" } else { "   ENG OFF" }), 14.0, if p.fuel_frac() < 0.1 || !p.running { Color32::from_rgb(255, 190, 60) } else { dim });
-                        shadow(ui, format!("FLAPS {:>2.0}°   GEAR {}{sb}", p.flap_notch_deg(), gear), 14.0, if p.gear > 0.0 && p.gear < 1.0 { Color32::from_rgb(255, 190, 60) } else { dim });
-                        if p.gear < 1.0 && agl < 150.0 && p.throttle < 0.35 && !self.crashed {
-                            if pad {
-                                ui.horizontal(|ui| {
-                                    shadow(ui, "GEAR UP".into(), 20.0, Color32::from_rgb(255, 90, 60));
-                                    padui::glyphs(ui, "L3", 22.0);
-                                });
+                if self.player.mode != PlayMode::PlaneFlight {
+                    let (hood, lu) = self.player.neighborhood();
+                    let zone_label = match lu {
+                        sources::LU_INDUSTRIAL => "INDUSTRIAL",
+                        sources::LU_COMMERCIAL => "COMMERCIAL",
+                        sources::LU_RESIDENTIAL => "RESIDENTIAL",
+                        sources::LU_OPEN => "OPEN",
+                        _ => if hood.cover > 0.35 { "COMMERCIAL" } else if hood.cover > 0.08 { "RESIDENTIAL" } else { "OPEN" },
+                    };
+                    let tier_label = if hood.wealth < 0.30 {
+                        "Low-Income / Gritty"
+                    } else if hood.wealth < 0.52 {
+                        "Working Class"
+                    } else if hood.wealth < 0.74 {
+                        "Mid-Tier"
+                    } else {
+                        "Affluent"
+                    };
+                    let amber = Color32::from_rgb(255, 196, 64);
+                    let green = Color32::from_rgb(110, 235, 140);
+                    let red = Color32::from_rgb(255, 90, 60);
+
+                    egui::Area::new(egui::Id::unique("street_hud")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
+                        panel.show(ui, |ui| {
+                            if self.player.mode == PlayMode::CarDrive {
+                                let car = self.player.car.as_ref();
+                                let kmh = car.map(|c| c.vel.length() * 3.6).unwrap_or(0.0);
+                                let rpm = car.map(|c| c.rpm).unwrap_or(player::IDLE_RPM);
+                                let gear_str = match car.map(|c| c.gear).unwrap_or(1) {
+                                    -1 => "R".to_string(),
+                                    0 => "N".to_string(),
+                                    g if kmh < 0.8 && car.map(|c| c.throttle).unwrap_or(0.0) < 0.05 => "N".to_string(),
+                                    g => format!("{g}"),
+                                };
+                                shadow(ui, "MODE: DRIVING   [F] Exit / Hijack Car   [C] Camera".into(), 13.5, amber);
+                                shadow(ui, format!("SPD  {:>4.0} km/h    GEAR [ {} ]", kmh, gear_str), 20.0, white);
+                                let rpm_frac = ((rpm - player::IDLE_RPM) / (player::REDLINE_RPM - player::IDLE_RPM)).clamp(0.0, 1.0);
+                                let bars = (rpm_frac * 16.0).round() as usize;
+                                let bar_str: String = (0..16).map(|i| if i < bars { '█' } else { '░' }).collect();
+                                let rpm_col = if rpm > 5800.0 { red } else if rpm > 4500.0 { amber } else { green };
+                                shadow(ui, format!("RPM  [{bar_str}] {:>4.0}", rpm), 14.0, rpm_col);
+                                shadow(ui, format!("HDG  {:>03.0}°   ALT {:>4.0} m{}", hdg, alt, if self.player.last_sample.on_bridge { " (BRIDGE)" } else if self.player.last_sample.on_rooftop { " (ROOFTOP)" } else { "" }), 13.0, dim);
                             } else {
-                                shadow(ui, "GEAR UP  (L)".into(), 20.0, Color32::from_rgb(255, 90, 60));
+                                let kmh = self.player.vel.truncate().length() * 3.6;
+                                shadow(ui, "MODE: ON FOOT   [F] Exit / Hijack Car   [C] Camera".into(), 13.5, green);
+                                shadow(ui, format!("SPD  {:>4.1} km/h    GEAR [ — ]", kmh), 20.0, white);
+                                shadow(ui, format!("HDG  {:>03.0}°   ALT {:>4.0} m{}", hdg, alt, if self.player.last_sample.on_rooftop { " (ROOFTOP)" } else if self.player.last_sample.on_bridge { " (BRIDGE)" } else { "" }), 13.0, dim);
                             }
-                        }
-                        if self.plane.stalled && !self.crashed {
-                            shadow(ui, "STALL".into(), 20.0, Color32::from_rgb(255, 90, 60));
-                        }
+                            ui.add_space(4.0);
+                            shadow(ui, format!("ZONE: {zone_label}  ·  {tier_label}"), 13.5, white);
+                            shadow(ui, format!("WEALTH {:>3.0}%   DENSITY {:>3.0}%   GREEN {:>3.0}%", hood.wealth * 100.0, hood.cover * 100.0, hood.green * 100.0), 12.5, dim);
+                            shadow(ui, format!("LAT {:.4}°{}   LON {:.4}°{}", lat.to_degrees().abs(), if lat >= 0.0 { 'N' } else { 'S' }, lon.to_degrees().abs(), if lon >= 0.0 { 'E' } else { 'W' }), 12.5, dim);
+                        });
                     });
-                });
+                } else {
+                    egui::Area::new(egui::Id::unique("hud")).anchor(Align2::LEFT_TOP, [14.0, 14.0]).show(ctx, |ui| {
+                        panel.show(ui, |ui| {
+                            shadow(ui, format!("IAS {:>4.0} kt", speed * 1.94384), 20.0, white);
+                            shadow(ui, format!("ALT {:>5.0} ft", alt * 3.28084), 20.0, white);
+                            shadow(ui, format!("AGL {:>5.0} ft", agl.max(0.0) * 3.28084), 14.0, dim);
+                            shadow(ui, format!("HDG {:>4.0}°   VS {:>+6.0} fpm", hdg, vs * 196.85), 14.0, dim);
+                            if wind_kt >= 0.5 {
+                                shadow(ui, format!("TAS {:>3.0}  GS {:>3.0} kt   WIND {:03.0}°/{:.0}", tas * 1.94384, gs * 1.94384, self.wx.wind_from, wind_kt), 14.0, dim);
+                            } else {
+                                shadow(ui, format!("TAS {:>4.0} kt", tas * 1.94384), 14.0, dim);
+                            }
+                            let p = &self.plane;
+                            if p.spec.is_jet() {
+                                let rev = if p.reverser > 0.95 { "   REV" } else if p.reverser > 0.0 { "   rev" } else { "" };
+                                shadow(ui, format!("THR {:>3.0}%   N1 {:>3.0}%   G {:>4.1}{rev}", p.throttle * 100.0, p.n1 * 100.0, p.g_load), 14.0, dim);
+                            } else {
+                                shadow(ui, format!("THR {:>3.0}%   {:>4.0} rpm   G {:>4.1}", p.throttle * 100.0, p.prop_rate * 60.0 / std::f64::consts::TAU, p.g_load), 14.0, if p.prop_rate * 60.0 / std::f64::consts::TAU > 2710.0 { Color32::from_rgb(255, 190, 60) } else { dim });
+                            }
+                            let gear = if p.gear >= 1.0 { "DOWN".to_string() } else if p.gear <= 0.0 { "UP".to_string() } else { "transit".to_string() };
+                            let sb = if p.spoilers > 0.05 { "   SPDBRK" } else { "" };
+                            shadow(ui, format!("FUEL {:>3.0}%   {:.0} kg{}", p.fuel_frac() * 100.0, p.fuel, if p.running { "" } else { "   ENG OFF" }), 14.0, if p.fuel_frac() < 0.1 || !p.running { Color32::from_rgb(255, 190, 60) } else { dim });
+                            shadow(ui, format!("FLAPS {:>2.0}°   GEAR {}{sb}", p.flap_notch_deg(), gear), 14.0, if p.gear > 0.0 && p.gear < 1.0 { Color32::from_rgb(255, 190, 60) } else { dim });
+                            if p.gear < 1.0 && agl < 150.0 && p.throttle < 0.35 && !self.crashed {
+                                if pad {
+                                    ui.horizontal(|ui| {
+                                        shadow(ui, "GEAR UP".into(), 20.0, Color32::from_rgb(255, 90, 60));
+                                        padui::glyphs(ui, "L3", 22.0);
+                                    });
+                                } else {
+                                    shadow(ui, "GEAR UP  (L)".into(), 20.0, Color32::from_rgb(255, 90, 60));
+                                }
+                            }
+                            if self.plane.stalled && !self.crashed {
+                                shadow(ui, "STALL".into(), 20.0, Color32::from_rgb(255, 90, 60));
+                            }
+                        });
+                    });
+                }
                 if let Some(lines) = &airport_hud {
                     egui::Area::new(egui::Id::unique("airport")).anchor(Align2::CENTER_TOP, [0.0, 14.0]).show(ctx, |ui| {
                         panel.show(ui, |ui| {
@@ -4905,7 +5253,7 @@ impl ApplicationHandler for App {
         if self.game.is_some() {
             return;
         }
-        let attrs = Window::default_attributes().with_title("Fable Flight").with_inner_size(winit::dpi::PhysicalSize::new(self.args.size.0, self.args.size.1));
+        let attrs = Window::default_attributes().with_title("Dopeworld").with_inner_size(winit::dpi::PhysicalSize::new(self.args.size.0, self.args.size.1));
         let window = Arc::new(el.create_window(attrs).expect("window"));
         match Game::new(window, &self.args) {
             Ok(g) => self.game = Some(g),

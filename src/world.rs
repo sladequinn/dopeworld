@@ -621,6 +621,12 @@ impl World {
         best.map(|(_, wpos, fwd_en)| (wpos, fwd_en))
     }
 
+    /// Whether the `DATA_ZOOM` building/road detail tile at `(lat, lon)` (radians) is loaded and ready.
+    pub fn has_detail_tile(&self, lat: f64, lon: f64) -> bool {
+        let id = TileId::at(lat, lon, DATA_ZOOM);
+        matches!(self.builds.get(&id), Some(BSlot::Ready(_)))
+    }
+
     /// Find and remove the nearest ambient `Parked` car within `max_dist` metres of `pos`.
     /// Returns `(world_pos, forward_world, up_world, model, col)`.
     pub fn take_nearest_parked_car(&mut self, pos: DVec3, max_dist: f64) -> Option<(DVec3, Vec3, Vec3, u8, [f32; 3])> {
@@ -1123,15 +1129,29 @@ impl World {
                             b.shown += real_dt;
                             // Towers carry their detail farther (buildings::HCLASS).
                             let (mid, fine) = (LOD_MID * b.tall * self.city_k, LOD_FINE * b.tall * self.city_k);
-                            b.mid_t = if dist < mid { b.mid_t + real_dt } else if dist > mid * 1.1 { 0.0 } else { b.mid_t };
-                            b.fine_t = if dist < fine { b.fine_t + real_dt } else if dist > fine * 1.2 { 0.0 } else { b.fine_t };
+                            if agl < 60.0 && dist < 250.0 {
+                                // At street level, snap the current tile's finest LOD in immediately.
+                                b.shown = b.shown.max(2.0);
+                                b.mid_t = b.mid_t.max(2.0);
+                                b.fine_t = b.fine_t.max(3.0);
+                            } else {
+                                b.mid_t = if dist < mid { b.mid_t + real_dt } else if dist > mid * 1.1 { 0.0 } else { b.mid_t };
+                                b.fine_t = if dist < fine { b.fine_t + real_dt } else if dist > fine * 1.2 { 0.0 } else { b.fine_t };
+                            }
                             if b.gpu.is_some() {
                                 self.draw_b.push(id);
                                 self.in_view.push(fr.sphere(b.center - cam, b.radius));
                             }
                         }
                         Some(BSlot::Loading) => {}
-                        None => self.wanted.push((0.8 + (d / w) as f32 * 0.6, id.with_tag())),
+                        None => {
+                            let prio = if agl < 80.0 && d < w * 1.5 {
+                                (d / w) as f32 * 0.1
+                            } else {
+                                0.8 + (d / w) as f32 * 0.6
+                            };
+                            self.wanted.push((prio, id.with_tag()));
+                        }
                     }
                 }
             }
