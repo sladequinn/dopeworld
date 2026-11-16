@@ -80,6 +80,10 @@ pub struct BuildingData {
     pub id: TileId,
     pub center: DVec3,
     pub radius: f64,
+    pub ext: f32,
+    pub unit_m: f32,
+    pub hoods: Hoods,
+    pub landuse: Vec<u8>,
     pub verts: Vec<BVertex>,
     pub indices: Vec<u32>,
     /// indices without the small rooftop detail
@@ -508,7 +512,7 @@ fn in_ring_m(p: Vec2, r: &[Vec2]) -> bool {
 
 const NB: usize = 8;
 /// What the surroundings of a spot in the tile are like.
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, Debug)]
 pub struct Hood {
     /// fraction of the ground covered by buildings
     pub cover: f32,
@@ -518,12 +522,19 @@ pub struct Hood {
     pub wealth: f32,
     pub mean_h: f32,
 }
-pub struct Hoods(Vec<Hood>);
+#[derive(Clone, Default)]
+pub struct Hoods(pub Vec<Hood>);
 impl Hoods {
     pub fn at(&self, cx: &Ctx, p: [f32; 2]) -> Hood {
-        // Bilinear so style changes gradually from block to block.
-        let f = |v: f32| (v / cx.ext * NB as f32 - 0.5).clamp(0.0, NB as f32 - 1.001);
-        let (x, y) = (f(p[0]), f(p[1]));
+        self.sample_uv(p[0] / cx.ext, p[1] / cx.ext)
+    }
+    /// Bilinearly sample neighbourhood metrics from normalized tile coordinates `u, v` in `0..1`.
+    pub fn sample_uv(&self, u: f32, v: f32) -> Hood {
+        if self.0.len() < NB * NB {
+            return Hood::default();
+        }
+        let f = |t: f32| (t * NB as f32 - 0.5).clamp(0.0, NB as f32 - 1.001);
+        let (x, y) = (f(u), f(v));
         let (x0, y0) = (x as usize, y as usize);
         let (fx, fy) = (x - x0 as f32, y - y0 as f32);
         let g = |i: usize, j: usize| self.0[j.min(NB - 1) * NB + i.min(NB - 1)];
@@ -531,7 +542,157 @@ impl Hoods {
         mix(mix(g(x0, y0), g(x0 + 1, y0), fx), mix(g(x0, y0 + 1), g(x0 + 1, y0 + 1), fx), fy)
     }
     pub fn mean_cover(&self) -> f32 {
-        self.0.iter().map(|h| h.cover).sum::<f32>() / self.0.len() as f32
+        self.0.iter().map(|h| h.cover).sum::<f32>() / self.0.len().max(1) as f32
+    }
+}
+
+/// Sample the 64x64 landuse grid (`LU_RESIDENTIAL`, `LU_COMMERCIAL`, `LU_INDUSTRIAL`, `LU_OPEN`)
+/// at normalized tile coordinates `(u, v)` in `0..1`.
+pub fn sample_landuse(landuse: &[u8], u: f32, v: f32) -> u8 {
+    if landuse.len() < 64 * 64 {
+        return 0;
+    }
+    let x = ((u * 64.0).floor() as isize).clamp(0, 63) as usize;
+    let y = ((v * 64.0).floor() as isize).clamp(0, 63) as usize;
+    landuse[y * 64 + x]
+}
+
+/// Test a circle of `radius` metres at normalized tile coordinates `p_uv` (`u` east, `v` south)
+/// against a closed footprint `ring` (also in `0..1` normalized tile coordinates), where the tile
+/// spans `tile_m` metres across.
+///
+/// Returns `Some((outward_normal_en, penetration_depth_m))` in the local East-North frame (`+x` East, `+y` North).
+pub fn collide_ring_circle(p_uv: [f32; 2], radius: f32, tile_m: f32, ring: &[[f32; 2]]) -> Option<(Vec2, f32)> {
+    let n = ring.len();
+    if n < 3 || tile_m <= 1e-3 {
+        return None;
+    }
+    let inside = point_in_ring(p_uv, ring);
+    let p = Vec2::new(p_uv[0], p_uv[1]);
+
+    let mut signed_area2 = 0.0f32;
+    for i in 0..n {
+        let a = Vec2::from(ring[i]);
+        let b = Vec2::from(ring[(i + 1) % n]);
+        signed_area2 += a.perp_dot(b);
+    }
+    let wind_sign = if signed_area2 >= 0.0 { 1.0f32 } else { -1.0f32 };
+
+    let mut best_d2 = f32::MAX;
+    let mut best_delta_en = Vec2::ZERO;
+    let mut best_edge_out_en = Vec2::X;
+
+    for i in 0..n {
+        let a = Vec2::from(ring[i]);
+        let b = Vec2::from(ring[(i + 1) % n]);
+        let ab = b - a;
+        let len2 = ab.length_squared();
+        if len2 < 1e-12 {
+            continue;
+        }
+        let t = ((p - a).dot(ab) / len2).clamp(0.0, 1.0);
+        let q = a + ab * t;
+        let d_uv = p - q;
+        let delta_en = Vec2::new(d_uv.x * tile_m, -d_uv.y * tile_m);
+        let d2 = delta_en.length_squared();
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best_delta_en = delta_en;
+            let edge_en = Vec2::new(ab.x, -ab.y).normalize_or_zero();
+            best_edge_out_en = Vec2::new(-edge_en.y, edge_en.x) * wind_sign;
+        }
+    }
+
+    let dist = best_d2.sqrt();
+    if inside {
+        let normal_en = if dist > 1e-4 { -best_delta_en / dist } else { best_edge_out_en };
+        Some((normal_en, radius + dist))
+    } else if dist < radius {
+        let normal_en = if dist > 1e-4 { best_delta_en / dist } else { best_edge_out_en };
+        Some((normal_en, radius - dist))
+    } else {
+        None
+    }
+}
+
+/// Find the closest drivable lane point and forward East-North tangent in `net`
+/// to planet-frame position `pos`, given the tile `center`.
+/// Returns `Some((dist_sq_m2, lane_pos_ecef, forward_en))`.
+pub fn nearest_lane_in_net(center: DVec3, net: &crate::roads::RoadNet, pos: DVec3) -> Option<(f32, DVec3, Vec2)> {
+    if net.paths.is_empty() {
+        return None;
+    }
+    let lp = (pos - center).as_vec3();
+    let up = center.normalize().as_vec3();
+    let (east, north, _) = geo::enu(pos);
+
+    let mut best_d2 = f32::MAX;
+    let mut best_pose: Option<(DVec3, Vec2)> = None;
+
+    for p in &net.paths {
+        if p.hidden || p.lanes == 0 || p.pts.len() < 2 || p.len < 1.0 {
+            continue;
+        }
+        for i in 0..p.pts.len() - 1 {
+            let a = p.pts[i];
+            let b = p.pts[i + 1];
+            let ab = b - a;
+            let seg_len2 = ab.length_squared();
+            if seg_len2 < 1e-6 {
+                continue;
+            }
+            let t = ((lp - a).dot(ab) / seg_len2).clamp(0.0, 1.0);
+            let s = (p.cum[i] + (p.cum[i + 1] - p.cum[i]) * t).clamp(0.0, p.len);
+            let (center_pt, tan) = p.sample(s);
+            let dir = tan.normalize_or_zero();
+            if dir == Vec3::ZERO {
+                continue;
+            }
+            let right = dir.cross(up).normalize_or_zero();
+            let lane_idx = 0u8;
+            let candidates: &[f32] = if p.oneway { &[1.0] } else { &[1.0, -1.0] };
+            for &dir_sign in candidates {
+                let travel_dir = dir * dir_sign;
+                let travel_right = right * dir_sign;
+                let off = if p.oneway {
+                    (lane_idx as f32 + 0.5 - p.lanes as f32 * 0.5) * p.lane_w
+                } else {
+                    (lane_idx as f32 + 0.5) * p.lane_w * if net.left { -1.0 } else { 1.0 }
+                };
+                let lane_local = center_pt + travel_right * off;
+                let d2 = (lane_local - lp).length_squared();
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    let world_pos = center + lane_local.as_dvec3();
+                    let td = travel_dir.as_dvec3();
+                    let fwd_en = Vec2::new(td.dot(east) as f32, td.dot(north) as f32).normalize_or_zero();
+                    let fwd_en = if fwd_en == Vec2::ZERO { Vec2::Y } else { fwd_en };
+                    best_pose = Some((world_pos, fwd_en));
+                }
+            }
+        }
+    }
+
+    best_pose.map(|(wpos, fwd)| (best_d2, wpos, fwd))
+}
+
+impl BuildingData {
+    /// Bilinearly sample neighbourhood metrics (`cover`, `green`, `wealth`, `mean_h`) at `(lat, lon)`.
+    pub fn hood_at(&self, lat: f64, lon: f64) -> Hood {
+        let (u, v) = self.id.frac(lat, lon);
+        self.hoods.sample_uv(u as f32, v as f32)
+    }
+
+    /// Sample the landuse classification (`LU_*`) at `(lat, lon)`.
+    pub fn landuse_at(&self, lat: f64, lon: f64) -> u8 {
+        let (u, v) = self.id.frac(lat, lon);
+        sample_landuse(&self.landuse, u as f32, v as f32)
+    }
+
+    /// Snap a planet-frame position `pos` to the nearest road lane in this tile,
+    /// returning `(lane_pos_ecef, forward_en)`.
+    pub fn nearest_road_spawn(&self, pos: DVec3) -> Option<(DVec3, Vec2)> {
+        nearest_lane_in_net(self.center, &self.net, pos).map(|(_, p, fwd)| (p, fwd))
     }
 }
 
@@ -1998,6 +2159,10 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
         id,
         center: cx.center,
         radius: m.radius.max(roads.radius) as f64 + 30.0,
+        ext: cx.ext,
+        unit_m: cx.unit_m,
+        hoods,
+        landuse,
         verts: m.v,
         indices,
         n_main,
@@ -2022,4 +2187,89 @@ pub fn build(src: &Sources, id: TileId) -> Result<BuildingData> {
         cells: grown.cells,
         near_idx: grown.near_idx,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::roads::{Path, RoadNet};
+
+    #[test]
+    fn hood_and_landuse_sampling() {
+        let mut cells = vec![Hood::default(); NB * NB];
+        for (i, h) in cells.iter_mut().enumerate() {
+            h.wealth = i as f32 / (NB * NB - 1) as f32;
+            h.cover = 0.5;
+            h.green = 0.25;
+            h.mean_h = 18.0;
+        }
+        let hoods = Hoods(cells);
+        let h_lo = hoods.sample_uv(0.0, 0.0);
+        let h_hi = hoods.sample_uv(1.0, 1.0);
+        let h_mid = hoods.sample_uv(0.5, 0.5);
+        assert!(h_lo.wealth < h_mid.wealth && h_mid.wealth < h_hi.wealth);
+        assert!((h_mid.cover - 0.5).abs() < 1e-5);
+
+        let mut lu = vec![0u8; 64 * 64];
+        lu[16 * 64 + 32] = LU_COMMERCIAL;
+        assert_eq!(sample_landuse(&lu, 32.5 / 64.0, 16.5 / 64.0), LU_COMMERCIAL);
+        assert_eq!(sample_landuse(&lu, 0.1, 0.1), 0);
+    }
+
+    #[test]
+    fn circle_ring_wall_collision_en_frame() {
+        // 20m x 20m building centred in a 1000m tile (u: 0.49..0.51 east, v: 0.49..0.51 south).
+        let tile_m = 1000.0;
+        let ring = [[0.49, 0.49], [0.51, 0.49], [0.51, 0.51], [0.49, 0.51]];
+
+        // Approaching from the East (u = 0.511 => 1.0m east of the east wall at u = 0.51) with radius 1.5m.
+        let hit_east = collide_ring_circle([0.511, 0.50], 1.5, tile_m, &ring).expect("should hit east wall");
+        assert!((hit_east.0.x - 1.0).abs() < 1e-3 && hit_east.0.y.abs() < 1e-3);
+        assert!((hit_east.1 - 0.5).abs() < 1e-2);
+
+        // Approaching from the North (v = 0.489 => 1.0m north of the north wall at v = 0.49) with radius 1.5m.
+        let hit_north = collide_ring_circle([0.50, 0.489], 1.5, tile_m, &ring).expect("should hit north wall");
+        assert!(hit_north.0.x.abs() < 1e-3 && (hit_north.0.y - 1.0).abs() < 1e-3);
+        assert!((hit_north.1 - 0.5).abs() < 1e-2);
+
+        // Inside the footprint near the west wall (u = 0.492 => 2.0m inside west wall at u = 0.49) with radius 0.5m.
+        let hit_inside = collide_ring_circle([0.492, 0.50], 0.5, tile_m, &ring).expect("inside should push out");
+        assert!((hit_inside.0.x + 1.0).abs() < 1e-3 && hit_inside.0.y.abs() < 1e-3);
+        assert!((hit_inside.1 - 2.5).abs() < 1e-2);
+
+        // Outside beyond radius.
+        assert!(collide_ring_circle([0.52, 0.50], 1.5, tile_m, &ring).is_none());
+    }
+
+    #[test]
+    fn nearest_road_lane_snap() {
+        let lat = 0.7f64;
+        let lon = -1.2f64;
+        let center = geo::lla_to_pos(lat, lon, 0.0);
+        let (east, north, _) = geo::enu(center);
+        let e3 = east.as_vec3();
+        let path = Path {
+            pts: vec![-e3 * 50.0, e3 * 50.0],
+            cum: vec![0.0, 100.0],
+            len: 100.0,
+            class: 2,
+            oneway: false,
+            lanes: 1,
+            lane_w: 3.5,
+            park_off: 0.0,
+            speed: 13.0,
+            hidden: false,
+            nodes: [1, 2],
+            edge: [0, 0],
+            junctions: Vec::new(),
+            keep_clear: Vec::new(),
+        };
+        let net = RoadNet { paths: vec![path], nodes: Default::default(), left: false, total_len: 100.0 };
+        // Query from south of the road: should snap to the eastbound (south/right-hand) lane (+East heading).
+        let query = center - north * 10.0;
+        let (_, snapped, fwd) = nearest_lane_in_net(center, &net, query).expect("lane found");
+        assert!((fwd.x - 1.0).abs() < 1e-2 && fwd.y.abs() < 1e-2);
+        let south_offset = -(snapped - center).dot(north);
+        assert!((south_offset - 1.75).abs() < 0.1);
+    }
 }
