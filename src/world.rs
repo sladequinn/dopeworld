@@ -1,13 +1,13 @@
 //! Streaming world: a quadtree of terrain tiles plus OSM building tiles,
 //! loaded around the camera, with ground/obstacle queries for the physics.
-use crate::buildings::{self, Footprint, Parked, TreeChunk};
+use crate::buildings::{self, Footprint, Hood, Hoods, Parked, TreeChunk};
 use crate::cars::{self, Car};
 use crate::geo::{self, TileId};
 use crate::render::{BuildGpu, DetailDraw, Inst, NearDraw, Renderer, TileGpu, TreeDraw, TreeInst, MAX_NEAR};
 use crate::roads::RoadNet;
 use crate::trees::{lod_span, tree_jit, NearCell, TreeDim, Under, CARDS, CARD_RANGE, IMP_DIST, LODS, LOD_DIST, LOD_JITTER, TREE_SPECIES, VARIANTS};
 use crate::sources::{Job, JobResult, Loader, DATA_ZOOM, GRID, GV};
-use glam::{DMat4, DVec3, DVec4, Vec3};
+use glam::{DMat4, DVec3, DVec4, Vec2, Vec3};
 use std::collections::{HashMap, VecDeque};
 
 struct Tile {
@@ -31,6 +31,10 @@ enum Slot {
 struct BTile {
     center: DVec3,
     radius: f64,
+    ext: f32,
+    unit_m: f32,
+    hoods: Hoods,
+    landuse: Vec<u8>,
     gpu: Option<BuildGpu>,
     footprints: Vec<Footprint>,
     last_used: u64,
@@ -103,6 +107,31 @@ pub struct BHit {
     /// footprint area (m²)
     pub area: f32,
 }
+
+/// Result of a street-level spatial, support, wall-collision, and socio-economic query.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct StreetSample {
+    /// Effective vertical support altitude (metres above sea level): terrain elevation,
+    /// elevated to bridge deck `top` when on an overpass or building `top` when on a rooftop.
+    pub support_alt: f32,
+    /// Underlying raw terrain elevation (metres above sea level).
+    pub terrain_alt: f32,
+    /// Whether the underlying terrain sample is water (and not bridged over).
+    pub water: bool,
+    /// True when `support_alt` is provided by a highway overpass / bridge deck (`f.kind == 1`).
+    pub on_bridge: bool,
+    /// True when `support_alt` is provided by a building rooftop (`f.kind == 0`).
+    pub on_rooftop: bool,
+    /// 2D building facade push-out `(outward_unit_normal_en, penetration_depth_m)` in the
+    /// local East-North tangent plane (`+x` East, `+y` North) when intersecting a wall.
+    pub wall_push: Option<(Vec2, f32)>,
+    /// Bilinearly interpolated socio-economic and structural neighbourhood metrics at `pos`.
+    pub hood: Hood,
+    /// Land-use classification byte (`LU_RESIDENTIAL`, `LU_COMMERCIAL`, `LU_INDUSTRIAL`, `LU_OPEN`, or `0`).
+    pub landuse: u8,
+}
+
+pub type SurfaceQuery = StreetSample;
 
 /// A standing tree, as the physics sees it.
 #[derive(Clone)]
@@ -482,6 +511,164 @@ impl World {
             }
         }
         None
+    }
+
+    /// Fast, allocation-free street-level query for walking (`OnFoot`) and wheeled vehicles (`CarDrive`).
+    ///
+    /// Evaluates terrain height, bridge deck support (`f.kind == 1`), flat rooftop support (`f.kind == 0`),
+    /// 2D building facade circle collision (`wall_push` in East-North frame), and socio-economic / landuse
+    /// intelligence at planet-frame position `pos`.
+    pub fn query_street(&self, pos: DVec3, body_alt: f32, radius: f32) -> StreetSample {
+        let (lat, lon, _) = geo::pos_to_lla(pos);
+        let g = self.terrain_ground(lat, lon);
+        let terrain_alt = g.as_ref().map(|g| g.h as f32).unwrap_or(0.0);
+        let mut water = g.as_ref().is_some_and(|g| g.water);
+        let mut support_alt = terrain_alt;
+        let mut on_bridge = false;
+        let mut on_rooftop = false;
+        let mut wall_push: Option<(Vec2, f32)> = None;
+        let mut hood = Hood::default();
+        let mut landuse = 0u8;
+
+        let id = TileId::at(lat, lon, DATA_ZOOM);
+        if let Some(BSlot::Ready(b)) = self.builds.get(&id) {
+            let (u, v) = id.frac(lat, lon);
+            let p_uv = [u as f32, v as f32];
+            hood = b.hoods.sample_uv(p_uv[0], p_uv[1]);
+            landuse = buildings::sample_landuse(&b.landuse, p_uv[0], p_uv[1]);
+
+            let tile_m = (b.ext * b.unit_m).max(1.0);
+            let r_uv = (radius.max(0.0) / tile_m) + 1e-5;
+
+            for f in &b.footprints {
+                if !f.alive {
+                    continue;
+                }
+                if p_uv[0] >= f.min[0] && p_uv[0] <= f.max[0] && p_uv[1] >= f.min[1] && p_uv[1] <= f.max[1] {
+                    if f.kind == 1 {
+                        if body_alt >= f.base - 1.5 && f.top >= support_alt && buildings::point_in_ring(p_uv, &f.ring) {
+                            support_alt = f.top;
+                            on_bridge = true;
+                            on_rooftop = false;
+                            water = false;
+                        }
+                    } else if f.kind == 0 && body_alt >= f.top - 0.6 && f.top >= support_alt && buildings::point_in_ring(p_uv, &f.ring) {
+                        support_alt = f.top;
+                        on_rooftop = true;
+                        on_bridge = false;
+                        water = false;
+                    }
+                }
+
+                if f.kind == 0 && radius > 0.0 && body_alt < f.top - 0.6 && body_alt + 2.0 > f.base {
+                    if p_uv[0] + r_uv < f.min[0] || p_uv[0] - r_uv > f.max[0] || p_uv[1] + r_uv < f.min[1] || p_uv[1] - r_uv > f.max[1] {
+                        continue;
+                    }
+                    if let Some((normal_en, depth)) = buildings::collide_ring_circle(p_uv, radius, tile_m, &f.ring) {
+                        if wall_push.is_none_or(|(_, prev_depth)| depth > prev_depth) {
+                            wall_push = Some((normal_en, depth));
+                        }
+                    }
+                }
+            }
+        }
+
+        StreetSample {
+            support_alt,
+            terrain_alt,
+            water,
+            on_bridge,
+            on_rooftop,
+            wall_push,
+            hood,
+            landuse,
+        }
+    }
+
+    /// Search loaded `DATA_ZOOM` `RoadNet` tiles around `(lat, lon)` (radians) and return the
+    /// exact planet-frame `DVec3` position on the nearest drivable road lane together with
+    /// the lane's forward unit heading `Vec2` in the local East-North frame (`+x` East, `+y` North).
+    pub fn nearest_road_spawn(&self, lat: f64, lon: f64) -> Option<(DVec3, Vec2)> {
+        let gh = self.terrain_ground(lat, lon).map(|g| g.h).unwrap_or(0.0);
+        let pos = geo::lla_to_pos(lat, lon, gh);
+        self.nearest_road_spawn_pos(pos)
+    }
+
+    /// Search loaded `DATA_ZOOM` `RoadNet` tiles in a 3x3 neighbourhood around `pos` and return
+    /// `(lane_pos_ecef, forward_en)` on the closest road lane.
+    pub fn nearest_road_spawn_pos(&self, pos: DVec3) -> Option<(DVec3, Vec2)> {
+        let (lat, lon, _) = geo::pos_to_lla(pos);
+        let c = TileId::at(lat, lon, DATA_ZOOM);
+        let size = 1i64 << DATA_ZOOM;
+        let mut best: Option<(f32, DVec3, Vec2)> = None;
+
+        for dy in -1..=1i64 {
+            for dx in -1..=1i64 {
+                let (x, y) = ((c.x as i64 + dx).rem_euclid(size), c.y as i64 + dy);
+                if y < 0 || y >= size {
+                    continue;
+                }
+                let id = TileId::new(DATA_ZOOM, x as u32, y as u32);
+                let Some(BSlot::Ready(b)) = self.builds.get(&id) else { continue };
+                if let Some((d2, wpos, fwd_en)) = buildings::nearest_lane_in_net(b.center, &b.net, pos) {
+                    if best.is_none_or(|(prev_d2, _, _)| d2 < prev_d2) {
+                        best = Some((d2, wpos, fwd_en));
+                    }
+                }
+            }
+        }
+
+        best.map(|(_, wpos, fwd_en)| (wpos, fwd_en))
+    }
+
+    /// Whether the `DATA_ZOOM` building/road detail tile at `(lat, lon)` (radians) is loaded and ready.
+    pub fn has_detail_tile(&self, lat: f64, lon: f64) -> bool {
+        let id = TileId::at(lat, lon, DATA_ZOOM);
+        matches!(self.builds.get(&id), Some(BSlot::Ready(_)))
+    }
+
+    /// Find and remove the nearest ambient `Parked` car within `max_dist` metres of `pos`.
+    /// Returns `(world_pos, forward_world, up_world, model, col)`.
+    pub fn take_nearest_parked_car(&mut self, pos: DVec3, max_dist: f64) -> Option<(DVec3, Vec3, Vec3, u8, [f32; 3])> {
+        let (lat, lon, _) = geo::pos_to_lla(pos);
+        let c = TileId::at(lat, lon, DATA_ZOOM);
+        let size = 1i64 << DATA_ZOOM;
+        let max_d2 = (max_dist * max_dist) as f32;
+        let mut best: Option<(TileId, usize, f32)> = None;
+
+        for dy in -1..=1i64 {
+            for dx in -1..=1i64 {
+                let (x, y) = ((c.x as i64 + dx).rem_euclid(size), c.y as i64 + dy);
+                if y < 0 || y >= size {
+                    continue;
+                }
+                let id = TileId::new(DATA_ZOOM, x as u32, y as u32);
+                let Some(BSlot::Ready(b)) = self.builds.get(&id) else { continue };
+                let lp = (pos - b.center).as_vec3();
+                for (i, p) in b.parked.iter().enumerate() {
+                    let d2 = (p.pos - lp).length_squared();
+                    if d2 <= max_d2 && best.is_none_or(|(_, _, prev_d2)| d2 < prev_d2) {
+                        best = Some((id, i, d2));
+                    }
+                }
+            }
+        }
+
+        let (id, idx, _) = best?;
+        let Some(BSlot::Ready(b)) = self.builds.get_mut(&id) else { return None };
+        let p = b.parked.swap_remove(idx);
+        Some((b.center + p.pos.as_dvec3(), p.fwd, p.up, p.model, p.col))
+    }
+
+    /// Re-insert a parked car into the loaded `DATA_ZOOM` tile at `pos` so a previously
+    /// driven vehicle remains parked in the world when the player hijacks another car.
+    pub fn insert_parked_car(&mut self, pos: DVec3, fwd: Vec3, up: Vec3, model: u8, col: [f32; 3]) {
+        let (lat, lon, _) = geo::pos_to_lla(pos);
+        let id = TileId::at(lat, lon, DATA_ZOOM);
+        if let Some(BSlot::Ready(b)) = self.builds.get_mut(&id) {
+            let local_pos = (pos - b.center).as_vec3();
+            b.parked.push(Parked { pos: local_pos, fwd, up, model, col });
+        }
     }
 
     /// Standing trees whose base is within `r` metres (horizontally) of a point.
@@ -942,15 +1129,29 @@ impl World {
                             b.shown += real_dt;
                             // Towers carry their detail farther (buildings::HCLASS).
                             let (mid, fine) = (LOD_MID * b.tall * self.city_k, LOD_FINE * b.tall * self.city_k);
-                            b.mid_t = if dist < mid { b.mid_t + real_dt } else if dist > mid * 1.1 { 0.0 } else { b.mid_t };
-                            b.fine_t = if dist < fine { b.fine_t + real_dt } else if dist > fine * 1.2 { 0.0 } else { b.fine_t };
+                            if agl < 60.0 && dist < 250.0 {
+                                // At street level, snap the current tile's finest LOD in immediately.
+                                b.shown = b.shown.max(2.0);
+                                b.mid_t = b.mid_t.max(2.0);
+                                b.fine_t = b.fine_t.max(3.0);
+                            } else {
+                                b.mid_t = if dist < mid { b.mid_t + real_dt } else if dist > mid * 1.1 { 0.0 } else { b.mid_t };
+                                b.fine_t = if dist < fine { b.fine_t + real_dt } else if dist > fine * 1.2 { 0.0 } else { b.fine_t };
+                            }
                             if b.gpu.is_some() {
                                 self.draw_b.push(id);
                                 self.in_view.push(fr.sphere(b.center - cam, b.radius));
                             }
                         }
                         Some(BSlot::Loading) => {}
-                        None => self.wanted.push((0.8 + (d / w) as f32 * 0.6, id.with_tag())),
+                        None => {
+                            let prio = if agl < 80.0 && d < w * 1.5 {
+                                (d / w) as f32 * 0.1
+                            } else {
+                                0.8 + (d / w) as f32 * 0.6
+                            };
+                            self.wanted.push((prio, id.with_tag()));
+                        }
                     }
                 }
             }
@@ -1055,7 +1256,7 @@ impl World {
             let main = bd.cls[0];
             let tall = (0..buildings::HCLASS.len()).find(|&c| main[c] > if c == 0 { 0 } else { main[c - 1] }).map_or(1.0, |c| buildings::HCLASS[c].1);
             let cars = cars::spawn(&bd.net, id.x.wrapping_mul(2246822519) ^ id.y.wrapping_mul(3266489917));
-            self.builds.insert(id, BSlot::Ready(Box::new(BTile { center: bd.center, radius: bd.radius, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall })));
+            self.builds.insert(id, BSlot::Ready(Box::new(BTile { center: bd.center, radius: bd.radius, ext: bd.ext, unit_m: bd.unit_m, hoods: bd.hoods, landuse: bd.landuse, gpu: Some(gpu), footprints: bd.footprints, last_used: self.frame, net: bd.net, cars, parked: bd.parked, trees: bd.trees, tree_var: bd.tree_var, chunks: bd.chunks, under: bd.under, cells: bd.cells, near_idx: bd.near_idx, ax: bd.ax, ay: bd.ay, shown: 0.0, mid_t: 0.0, fine_t: 0.0, tall })));
         }
         bytes
     }
@@ -1461,5 +1662,152 @@ impl Tag for TileId {
     /// Marks a request to remake a loaded terrain tile (new imagery source).
     fn with_refresh(self) -> Self {
         TileId::new(self.z | 0x40, self.x, self.y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sources::{Sources, LU_INDUSTRIAL};
+    use std::sync::Arc;
+
+    #[test]
+    fn query_street_bridge_rooftop_walls_and_hood() {
+        let dir = std::env::temp_dir().join("fablegame-test-cache");
+        let src = Arc::new(Sources::new(crate::fetch::Fetcher::new(dir, true), String::new()));
+        let mut world = World::new(Loader::new(src, 0), DATA_ZOOM);
+        world.flat = Some(10.0);
+
+        let lat = 0.65f64;
+        let lon = -1.35f64;
+        let id = TileId::at(lat, lon, DATA_ZOOM);
+        let (clat, clon) = id.lat_lon(0.5, 0.5);
+        let center = geo::lla_to_pos(clat, clon, 0.0);
+        let tile_w = id.width_m() as f32;
+
+        let hoods = Hoods(vec![Hood { cover: 0.42, green: 0.18, wealth: 0.77, mean_h: 24.0 }; 64]);
+        let mut landuse = vec![0u8; 64 * 64];
+        for v in &mut landuse {
+            *v = LU_INDUSTRIAL;
+        }
+
+        // Building footprint at uv 0.48..0.50 (base 10m, top 50m) and bridge deck at uv 0.52..0.54 (base 22m, top 24m).
+        let bld_fp = Footprint {
+            min: [0.48, 0.48],
+            max: [0.50, 0.50],
+            ring: vec![[0.48, 0.48], [0.50, 0.48], [0.50, 0.50], [0.48, 0.50]],
+            base: 10.0,
+            top: 50.0,
+            kind: 0,
+            col: [200, 200, 200],
+            main: (0, 0),
+            det: (0, 0),
+            fine: (0, 0),
+            far: (0, 0),
+            alive: true,
+            center: Vec3::ZERO,
+            area: 400.0,
+            sty: [0; 4],
+            gref: 10.0,
+            roof_col: [120; 3],
+            tiers: Vec::new(),
+        };
+        let bridge_fp = Footprint {
+            min: [0.52, 0.52],
+            max: [0.54, 0.54],
+            ring: vec![[0.52, 0.52], [0.54, 0.52], [0.54, 0.54], [0.52, 0.54]],
+            base: 22.0,
+            top: 24.0,
+            kind: 1,
+            col: [150, 150, 150],
+            main: (0, 0),
+            det: (0, 0),
+            fine: (0, 0),
+            far: (0, 0),
+            alive: true,
+            center: Vec3::ZERO,
+            area: 0.0,
+            sty: [0; 4],
+            gref: 0.0,
+            roof_col: [0; 3],
+            tiers: Vec::new(),
+        };
+
+        let (east, _, _) = geo::enu(center);
+        let e3 = east.as_vec3();
+        let net = RoadNet {
+            paths: vec![crate::roads::Path {
+                pts: vec![-e3 * 40.0, e3 * 40.0],
+                cum: vec![0.0, 80.0],
+                len: 80.0,
+                class: 2,
+                oneway: true,
+                lanes: 1,
+                lane_w: 3.5,
+                park_off: 0.0,
+                speed: 15.0,
+                hidden: false,
+                nodes: [1, 2],
+                edge: [0, 0],
+                junctions: Vec::new(),
+                keep_clear: Vec::new(),
+            }],
+            nodes: Default::default(),
+            left: false,
+            total_len: 80.0,
+        };
+
+        world.builds.insert(
+            id,
+            BSlot::Ready(Box::new(BTile {
+                center,
+                radius: 1500.0,
+                ext: 4096.0,
+                unit_m: tile_w / 4096.0,
+                hoods,
+                landuse,
+                gpu: None,
+                footprints: vec![bld_fp, bridge_fp],
+                last_used: 0,
+                net,
+                cars: Vec::new(),
+                parked: Vec::new(),
+                trees: Vec::new(),
+                tree_var: Vec::new(),
+                chunks: Vec::new(),
+                under: Vec::new(),
+                cells: Vec::new(),
+                near_idx: Vec::new(),
+                ax: [0.0; 4],
+                ay: [0.0; 4],
+                shown: 1.0,
+                mid_t: 1.0,
+                fine_t: 1.0,
+                tall: 1.0,
+            })),
+        );
+
+        // 1. Bridge underpass vs overpass support.
+        let (blat, blon) = id.lat_lon(0.53, 0.53);
+        let bpos = geo::lla_to_pos(blat, blon, 10.0);
+        let under = world.query_street(bpos, 12.0, 1.0);
+        assert!(!under.on_bridge && (under.support_alt - 10.0).abs() < 1e-3);
+        let over = world.query_street(bpos, 23.0, 1.0);
+        assert!(over.on_bridge && (over.support_alt - 24.0).abs() < 1e-3);
+        assert_eq!(over.landuse, LU_INDUSTRIAL);
+        assert!((over.hood.wealth - 0.77).abs() < 1e-3);
+
+        // 2. Rooftop support vs street-level wall push.
+        let (rlat, rlon) = id.lat_lon(0.49, 0.49);
+        let rpos = geo::lla_to_pos(rlat, rlon, 50.0);
+        let roof = world.query_street(rpos, 49.6, 0.5);
+        assert!(roof.on_rooftop && (roof.support_alt - 50.0).abs() < 1e-3 && roof.wall_push.is_none());
+
+        let street_inside = world.query_street(rpos, 12.0, 0.8);
+        assert!(!street_inside.on_rooftop && street_inside.wall_push.is_some());
+
+        // 3. Nearest road spawn from World.
+        let (_, fwd) = world.nearest_road_spawn(clat, clon).expect("road spawn");
+        assert!((fwd.x - 1.0).abs() < 1e-2 && fwd.y.abs() < 1e-2);
     }
 }
