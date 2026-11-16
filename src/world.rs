@@ -621,6 +621,50 @@ impl World {
         best.map(|(_, wpos, fwd_en)| (wpos, fwd_en))
     }
 
+    /// Find and remove the nearest ambient `Parked` car within `max_dist` metres of `pos`.
+    /// Returns `(world_pos, forward_world, up_world, model, col)`.
+    pub fn take_nearest_parked_car(&mut self, pos: DVec3, max_dist: f64) -> Option<(DVec3, Vec3, Vec3, u8, [f32; 3])> {
+        let (lat, lon, _) = geo::pos_to_lla(pos);
+        let c = TileId::at(lat, lon, DATA_ZOOM);
+        let size = 1i64 << DATA_ZOOM;
+        let max_d2 = (max_dist * max_dist) as f32;
+        let mut best: Option<(TileId, usize, f32)> = None;
+
+        for dy in -1..=1i64 {
+            for dx in -1..=1i64 {
+                let (x, y) = ((c.x as i64 + dx).rem_euclid(size), c.y as i64 + dy);
+                if y < 0 || y >= size {
+                    continue;
+                }
+                let id = TileId::new(DATA_ZOOM, x as u32, y as u32);
+                let Some(BSlot::Ready(b)) = self.builds.get(&id) else { continue };
+                let lp = (pos - b.center).as_vec3();
+                for (i, p) in b.parked.iter().enumerate() {
+                    let d2 = (p.pos - lp).length_squared();
+                    if d2 <= max_d2 && best.is_none_or(|(_, _, prev_d2)| d2 < prev_d2) {
+                        best = Some((id, i, d2));
+                    }
+                }
+            }
+        }
+
+        let (id, idx, _) = best?;
+        let Some(BSlot::Ready(b)) = self.builds.get_mut(&id) else { return None };
+        let p = b.parked.swap_remove(idx);
+        Some((b.center + p.pos.as_dvec3(), p.fwd, p.up, p.model, p.col))
+    }
+
+    /// Re-insert a parked car into the loaded `DATA_ZOOM` tile at `pos` so a previously
+    /// driven vehicle remains parked in the world when the player hijacks another car.
+    pub fn insert_parked_car(&mut self, pos: DVec3, fwd: Vec3, up: Vec3, model: u8, col: [f32; 3]) {
+        let (lat, lon, _) = geo::pos_to_lla(pos);
+        let id = TileId::at(lat, lon, DATA_ZOOM);
+        if let Some(BSlot::Ready(b)) = self.builds.get_mut(&id) {
+            let local_pos = (pos - b.center).as_vec3();
+            b.parked.push(Parked { pos: local_pos, fwd, up, model, col });
+        }
+    }
+
     /// Standing trees whose base is within `r` metres (horizontally) of a point.
     pub fn trees_near(&self, p: DVec3, r: f64, out: &mut Vec<TreeRef>) {
         let (lat, lon, _) = geo::pos_to_lla(p);

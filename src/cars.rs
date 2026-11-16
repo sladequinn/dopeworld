@@ -59,25 +59,26 @@ impl MB {
     }
 }
 
-struct Spec {
-    len: f32,
-    w: f32,
-    h: f32,
-    clear: f32,
-    belt: f32,
-    hood: f32,
-    deck: f32,
-    hood_end: f32,
-    roof0: f32,
-    roof1: f32,
-    deck0: f32,
-    wheel_r: f32,
-    axles: &'static [f32],
-    inset: f32,
-    glass_to: f32,
-    bed: bool,
-    flat_front: bool,
-    cargo: bool,
+#[derive(Copy, Clone, Debug)]
+pub struct Spec {
+    pub len: f32,
+    pub w: f32,
+    pub h: f32,
+    pub clear: f32,
+    pub belt: f32,
+    pub hood: f32,
+    pub deck: f32,
+    pub hood_end: f32,
+    pub roof0: f32,
+    pub roof1: f32,
+    pub deck0: f32,
+    pub wheel_r: f32,
+    pub axles: &'static [f32],
+    pub inset: f32,
+    pub glass_to: f32,
+    pub bed: bool,
+    pub flat_front: bool,
+    pub cargo: bool,
 }
 
 fn lerp_knots(k: &[(f32, f32)], f: f32) -> f32 {
@@ -212,21 +213,21 @@ fn vehicle(s: &Spec) -> (Vec<MeshVertex>, Vec<u32>) {
     (m.v, m.i)
 }
 
+pub const BASE_SPEC: Spec = Spec { len: 4.7, w: 0.91, h: 1.43, clear: 0.2, belt: 0.92, hood: 0.86, deck: 0.95, hood_end: 0.3, roof0: 0.41, roof1: 0.68, deck0: 0.82, wheel_r: 0.33, axles: &[0.185, 0.8], inset: 0.2, glass_to: 2.0, bed: false, flat_front: false, cargo: false };
+
+pub const SPECS: [Spec; N_MODELS] = [
+    Spec { ..BASE_SPEC },
+    Spec { len: 4.0, w: 0.88, h: 1.47, belt: 0.94, hood: 0.88, deck: 1.0, hood_end: 0.26, roof0: 0.38, roof1: 0.8, deck0: 0.96, axles: &[0.2, 0.82], ..BASE_SPEC },
+    Spec { w: 0.96, h: 1.74, clear: 0.27, belt: 1.08, hood: 1.02, deck: 1.14, hood_end: 0.27, roof0: 0.37, roof1: 0.9, deck0: 0.985, wheel_r: 0.38, inset: 0.16, ..BASE_SPEC },
+    Spec { len: 5.4, w: 0.98, h: 1.8, clear: 0.3, belt: 1.12, hood: 1.08, deck: 1.16, hood_end: 0.27, roof0: 0.35, roof1: 0.55, deck0: 0.6, wheel_r: 0.4, axles: &[0.17, 0.78], inset: 0.14, bed: true, ..BASE_SPEC },
+    Spec { len: 5.2, w: 0.98, h: 2.0, clear: 0.24, belt: 1.12, hood: 1.05, deck: 1.96, hood_end: 0.1, roof0: 0.2, roof1: 0.98, deck0: 0.99, wheel_r: 0.36, axles: &[0.17, 0.78], inset: 0.1, glass_to: 0.4, ..BASE_SPEC },
+    Spec { len: 4.4, w: 0.96, h: 1.2, clear: 0.13, belt: 0.8, hood: 0.72, deck: 0.92, hood_end: 0.36, roof0: 0.48, roof1: 0.62, deck0: 0.9, wheel_r: 0.34, axles: &[0.19, 0.8], inset: 0.26, ..BASE_SPEC },
+    Spec { len: 11.5, w: 1.26, h: 3.1, clear: 0.34, belt: 1.5, hood: 1.5, deck: 3.05, hood_end: 0.006, roof0: 0.02, roof1: 0.985, deck0: 0.995, wheel_r: 0.5, axles: &[0.16, 0.74, 0.8], inset: 0.06, flat_front: true, ..BASE_SPEC },
+    Spec { len: 7.6, w: 1.12, h: 2.5, clear: 0.4, belt: 1.5, hood: 1.42, deck: 1.05, hood_end: 0.05, roof0: 0.1, roof1: 0.25, deck0: 0.27, wheel_r: 0.46, axles: &[0.12, 0.75, 0.82], inset: 0.08, cargo: true, ..BASE_SPEC },
+];
+
 pub fn build_models() -> Vec<(Vec<MeshVertex>, Vec<u32>)> {
-    let base = Spec { len: 4.7, w: 0.91, h: 1.43, clear: 0.2, belt: 0.92, hood: 0.86, deck: 0.95, hood_end: 0.3, roof0: 0.41, roof1: 0.68, deck0: 0.82, wheel_r: 0.33, axles: &[0.185, 0.8], inset: 0.2, glass_to: 2.0, bed: false, flat_front: false, cargo: false };
-    [
-        Spec { ..base },
-        Spec { len: 4.0, w: 0.88, h: 1.47, belt: 0.94, hood: 0.88, deck: 1.0, hood_end: 0.26, roof0: 0.38, roof1: 0.8, deck0: 0.96, axles: &[0.2, 0.82], ..base },
-        Spec { w: 0.96, h: 1.74, clear: 0.27, belt: 1.08, hood: 1.02, deck: 1.14, hood_end: 0.27, roof0: 0.37, roof1: 0.9, deck0: 0.985, wheel_r: 0.38, inset: 0.16, ..base },
-        Spec { len: 5.4, w: 0.98, h: 1.8, clear: 0.3, belt: 1.12, hood: 1.08, deck: 1.16, hood_end: 0.27, roof0: 0.35, roof1: 0.55, deck0: 0.6, wheel_r: 0.4, axles: &[0.17, 0.78], inset: 0.14, bed: true, ..base },
-        Spec { len: 5.2, w: 0.98, h: 2.0, clear: 0.24, belt: 1.12, hood: 1.05, deck: 1.96, hood_end: 0.1, roof0: 0.2, roof1: 0.98, deck0: 0.99, wheel_r: 0.36, axles: &[0.17, 0.78], inset: 0.1, glass_to: 0.4, ..base },
-        Spec { len: 4.4, w: 0.96, h: 1.2, clear: 0.13, belt: 0.8, hood: 0.72, deck: 0.92, hood_end: 0.36, roof0: 0.48, roof1: 0.62, deck0: 0.9, wheel_r: 0.34, axles: &[0.19, 0.8], inset: 0.26, ..base },
-        Spec { len: 11.5, w: 1.26, h: 3.1, clear: 0.34, belt: 1.5, hood: 1.5, deck: 3.05, hood_end: 0.006, roof0: 0.02, roof1: 0.985, deck0: 0.995, wheel_r: 0.5, axles: &[0.16, 0.74, 0.8], inset: 0.06, flat_front: true, ..base },
-        Spec { len: 7.6, w: 1.12, h: 2.5, clear: 0.4, belt: 1.5, hood: 1.42, deck: 1.05, hood_end: 0.05, roof0: 0.1, roof1: 0.25, deck0: 0.27, wheel_r: 0.46, axles: &[0.12, 0.75, 0.82], inset: 0.08, cargo: true, ..base },
-    ]
-    .iter()
-    .map(vehicle)
-    .collect()
+    SPECS.iter().map(vehicle).collect()
 }
 
 /// A lumpy boulder for terrain debris.
@@ -298,7 +299,7 @@ fn density(class: u8) -> f32 {
     }
 }
 
-fn livery(model: u8, h: f32) -> [f32; 3] {
+pub fn livery(model: u8, h: f32) -> [f32; 3] {
     match model {
         6 => [[0.75, 0.75, 0.72], [0.5, 0.03, 0.02], [0.62, 0.42, 0.02], [0.03, 0.12, 0.35], [0.6, 0.22, 0.02]][(h * 5.0) as usize % 5],
         7 => [[0.75, 0.75, 0.72], [0.4, 0.4, 0.4], [0.05, 0.1, 0.3], [0.4, 0.04, 0.03]][(h * 4.0) as usize % 4],

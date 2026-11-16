@@ -32,6 +32,7 @@ mod menu;
 mod padui;
 mod pave;
 mod photonight;
+mod player;
 mod relight;
 mod weather;
 mod mvt;
